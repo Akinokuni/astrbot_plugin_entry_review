@@ -71,7 +71,7 @@
 ```json
 {
   "source_group": "源群号",
-  "review_group": "审核群号",
+  "target_group": "审核群号",
   "authorized_users": ["审核员QQ号1", "审核员QQ号2"]
 }
 ```
