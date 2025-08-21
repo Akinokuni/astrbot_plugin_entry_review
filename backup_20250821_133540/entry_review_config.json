@@ -1,0 +1,10 @@
+{
+  "target_groups": [],
+  "review_group": 0,
+  "auto_approve_time": 300,
+  "debug_mode": true,
+  "admin_users": [],
+  "polling_interval": 30,
+  "max_retry_count": 3,
+  "use_system_msg_polling": true
+}

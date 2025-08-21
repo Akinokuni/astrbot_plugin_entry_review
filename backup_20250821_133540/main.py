@@ -1,0 +1,746 @@
+import asyncio
+import time
+import re
+from typing import Dict, Any, Optional
+from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+from astrbot.api.star import Context, Star, register
+from astrbot.api import logger
+import json
+import os
+
+@register("astrbot_plugin_entry_review", "Developer", "入群申请审核插件，自动转发入群申请到指定群聊进行审核", "1.0.0")
+class EntryReviewPlugin(Star):
+    def __init__(self, context: Context):
+        super().__init__(context)
+        self.pending_requests: Dict[str, Dict[str, Any]] = {}  # 存储待审核的入群申请
+        self.load_config()
+
+    async def initialize(self):
+        """插件初始化"""
+        logger.info("入群申请审核插件已初始化")
+        
+        # 设置默认配置
+        if not hasattr(self, 'config') or not self.config:
+            self.config = {
+                "source_group_id": "",  # 监听入群申请的群号
+                "target_group_id": "",  # 转发审核消息的群号
+                "authorized_users": [],  # 有权限审核的用户列表
+                "auto_approve_timeout": 3600,  # 自动通过超时时间（秒）
+                "enable_auto_approve": True,  # 是否启用自动通过
+                "approval_message_template": "欢迎 {nickname} 加入群聊！",
+                "rejection_message_template": "很抱歉，您的入群申请未通过审核。原因：{reason}",
+                "debug_mode": False,  # 调试模式
+                "debug_log_events": False,  # 记录事件详情
+                "debug_log_api_calls": False  # 记录API调用
+            }
+            self.save_config()
+        
+        # 初始化调试模式
+        self._init_debug_mode()
+
+    def load_config(self):
+        """加载配置"""
+        try:
+            config_path = os.path.join(os.path.dirname(__file__), "config.json")
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    self.config = json.load(f)
+            else:
+                self.config = {
+                    "source_group_id": "",
+                    "target_group_id": "",
+                    "authorized_users": [],
+                    "auto_approve_timeout": 3600,
+                    "enable_auto_approve": True,
+                    "approval_message_template": "欢迎 {nickname} 加入群聊！",
+                    "rejection_message_template": "很抱歉，您的入群申请未通过审核。原因：{reason}"
+                }
+        except Exception as e:
+            logger.error(f"加载配置失败: {e}")
+            self.config = {
+                "source_group_id": "",
+                "target_group_id": "",
+                "authorized_users": [],
+                "auto_approve_timeout": 3600,
+                "enable_auto_approve": True,
+                "approval_message_template": "欢迎 {nickname} 加入群聊！",
+                "rejection_message_template": "很抱歉，您的入群申请未通过审核。原因：{reason}",
+                "debug_mode": False,
+                "debug_log_events": False,
+                "debug_log_api_calls": False
+            }
+    
+    def _init_debug_mode(self):
+        """初始化调试模式"""
+        self.debug_mode = self.config.get('debug_mode', False)
+        self.debug_log_events = self.config.get('debug_log_events', False)
+        self.debug_log_api_calls = self.config.get('debug_log_api_calls', False)
+        
+        if self.debug_mode:
+            logger.info("🐛 调试模式已启用")
+            logger.info(f"📝 事件详情记录: {'启用' if self.debug_log_events else '禁用'}")
+            logger.info(f"🔗 API调用记录: {'启用' if self.debug_log_api_calls else '禁用'}")
+    
+    def _debug_log(self, message: str, level: str = "DEBUG"):
+        """输出调试日志"""
+        if getattr(self, 'debug_mode', False):
+            if level == "INFO":
+                logger.info(f"🐛 [DEBUG] {message}")
+            elif level == "WARNING":
+                logger.warning(f"🐛 [DEBUG] {message}")
+            elif level == "ERROR":
+                logger.error(f"🐛 [DEBUG] {message}")
+            else:
+                logger.debug(f"🐛 [DEBUG] {message}")
+    
+    def _debug_log_event(self, event: AstrMessageEvent, action: str):
+        """记录事件详情"""
+        if getattr(self, 'debug_mode', False) and getattr(self, 'debug_log_events', False):
+            self._debug_log(f"事件处理 - {action}")
+            self._debug_log(f"  消息内容: {event.message_str}")
+            self._debug_log(f"  发送者ID: {event.sender_id}")
+            self._debug_log(f"  群组ID: {getattr(event, 'group_id', 'N/A')}")
+            self._debug_log(f"  消息类型: {getattr(event, 'message_type', 'N/A')}")
+            if hasattr(event, 'raw_message') and event.raw_message:
+                self._debug_log(f"  原始消息: {str(event.raw_message)[:200]}...")
+    
+    def _debug_log_api_call(self, api_name: str, params: dict, result: Any = None, error: Exception = None):
+        """记录API调用详情"""
+        if getattr(self, 'debug_mode', False) and getattr(self, 'debug_log_api_calls', False):
+            self._debug_log(f"API调用 - {api_name}")
+            self._debug_log(f"  参数: {params}")
+            if result is not None:
+                self._debug_log(f"  结果: {str(result)[:200]}...")
+            if error:
+                self._debug_log(f"  错误: {str(error)}", "ERROR")
+
+    def save_config(self):
+        """保存配置"""
+        try:
+            config_path = os.path.join(os.path.dirname(__file__), "config.json")
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存配置失败: {e}")
+
+    @filter.command("设置源群")
+    async def set_source_group(self, event: AstrMessageEvent, group_id: str):
+        """设置监听入群申请的源群"""
+        try:
+            self._debug_log_event(event, "设置源群")
+            self._debug_log(f"设置源群ID: {group_id}")
+            self.config["source_group_id"] = group_id
+            self.save_config()
+            event.set_result(MessageEventResult().message(f"已设置源群为：{group_id}"))
+        except Exception as e:
+            logger.error(f"设置源群失败: {e}")
+            self._debug_log(f"设置源群失败: {e}", "ERROR")
+            event.set_result(MessageEventResult().message(f"设置源群失败：{str(e)}"))
+
+    @filter.command("设置审核群")
+    async def set_target_group(self, event: AstrMessageEvent, group_id: str):
+        """设置转发审核消息的目标群"""
+        try:
+            self._debug_log_event(event, "设置审核群")
+            self._debug_log(f"设置审核群ID: {group_id}")
+            self.config["target_group_id"] = group_id
+            self.save_config()
+            event.set_result(MessageEventResult().message(f"已设置审核群为：{group_id}"))
+        except Exception as e:
+            logger.error(f"设置审核群失败: {e}")
+            self._debug_log(f"设置审核群失败: {e}", "ERROR")
+            event.set_result(MessageEventResult().message(f"设置审核群失败：{str(e)}"))
+
+    @filter.command("添加审核员")
+    async def add_reviewer(self, event: AstrMessageEvent, user_id: str):
+        """添加有权限审核的用户"""
+        try:
+            authorized_users = self.config.get("authorized_users", [])
+            if user_id not in authorized_users:
+                authorized_users.append(user_id)
+                self.config["authorized_users"] = authorized_users
+                self.save_config()
+                event.set_result(MessageEventResult().message(f"已添加审核员：{user_id}"))
+            else:
+                event.set_result(MessageEventResult().message(f"用户 {user_id} 已经是审核员"))
+        except Exception as e:
+            logger.error(f"添加审核员失败: {e}")
+            event.set_result(MessageEventResult().message(f"添加审核员失败：{str(e)}"))
+
+    @filter.command("查看配置")
+    async def show_config(self, event: AstrMessageEvent):
+        """查看当前配置"""
+        config_text = f"""当前配置：
+源群ID：{self.config.get('source_group_id', '未设置')}
+审核群ID：{self.config.get('target_group_id', '未设置')}
+审核员：{', '.join(self.config.get('authorized_users', []))}
+自动通过超时：{self.config.get('auto_approve_timeout', 3600)}秒
+启用自动通过：{self.config.get('enable_auto_approve', True)}"""
+        event.set_result(MessageEventResult().message(config_text))
+
+    def _safe_format(self, template: str, **kwargs) -> str:
+        """安全的字符串格式化，避免KeyError"""
+        try:
+            return template.format(**kwargs)
+        except KeyError as e:
+            logger.warning(f"模板格式化缺少参数: {e}")
+            return template
+
+    def _format_timestamp(self, timestamp: Optional[int] = None) -> str:
+        """格式化时间戳"""
+        if timestamp is None:
+            timestamp = int(time.time())
+        return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def handle_group_request_events(self, event: AstrMessageEvent, *args, **kwargs):
+        """处理群组相关事件，包括入群申请"""
+        try:
+            # 检查是否是入群申请事件
+            raw_message = getattr(event, 'raw_message', None)
+            if raw_message and hasattr(raw_message, 'post_type'):
+                if raw_message.post_type == 'request' and raw_message.request_type == 'group':
+                    context = kwargs.get('context')
+                    await self._process_group_request(event, context)
+                    return  # 处理完入群申请后直接返回
+            
+            # 检查是否是审核群的审核指令
+            if event.get_group_id() == self.config.get("target_group_id"):
+                context = kwargs.get('context')
+                await self._process_review_command(event, context)
+        except Exception as e:
+            logger.error(f"处理群组事件失败: {e}")
+
+
+
+    async def _process_group_request(self, event: AstrMessageEvent, context=None):
+        """处理入群申请"""
+        try:
+            self._debug_log_event(event, "处理入群申请")
+            raw_message = event.message_obj.raw_message
+            user_id = str(raw_message.get('user_id'))
+            group_id = str(raw_message.get('group_id'))
+            comment = raw_message.get('comment', '无')
+            flag = raw_message.get('flag', '')
+            
+            self._debug_log(f"入群申请详情 - 用户ID: {user_id}, 群ID: {group_id}, 申请理由: {comment}")
+            
+            # 检查是否是配置的源群
+            if group_id != self.config.get("source_group_id"):
+                self._debug_log(f"群ID不匹配，忽略申请 - 当前群: {group_id}, 配置源群: {self.config.get('source_group_id')}")
+                return
+            
+            # 获取申请者信息
+            nickname = f"用户{user_id}"
+            
+            # 存储申请信息
+            request_info = {
+                'user_id': user_id,
+                'group_id': group_id,
+                'nickname': nickname,
+                'comment': comment,
+                'flag': flag,
+                'timestamp': int(time.time()),
+                'status': 'pending'
+            }
+            
+            self.pending_requests[user_id] = request_info
+            
+            # 转发到审核群
+            target_group_id = self.config.get("target_group_id")
+            if target_group_id:
+                review_message = f"""📝 新的入群申请
+👤 申请人：{nickname} ({user_id})
+🏠 申请群：{group_id}
+💬 申请理由：{comment}
+⏰ 申请时间：{self._format_timestamp()}
+
+请审核员回复：
+✅ /通过 {user_id}
+❌ /拒绝 {user_id} [原因]"""
+                
+                await self.send_message_to_group(target_group_id, review_message)
+                
+                # 设置自动通过定时器
+                if self.config.get("enable_auto_approve", True):
+                    timeout = self.config.get("auto_approve_timeout", 3600)
+                    asyncio.create_task(self._auto_approve_after_timeout(user_id, int(group_id), nickname, flag))
+                    
+            logger.info(f"处理入群申请：用户 {user_id} 申请加入群 {group_id}")
+            
+        except Exception as e:
+            logger.error(f"处理入群申请失败: {e}")
+            error_context = {
+                'error': str(e),
+                'event_type': type(event).__name__,
+                'raw_message': str(getattr(event, 'raw_message', 'None'))
+            }
+            
+            # 发送错误通知到审核群
+            target_group_id = self.config.get("target_group_id")
+            if target_group_id:
+                error_message = f"⚠️ 处理入群申请时发生错误：{str(e)}"
+                try:
+                    await self.send_message_to_group(target_group_id, error_message)
+                except Exception as send_error:
+                    logger.error(f"发送错误通知失败: {send_error}")
+
+    async def handle_group_request_simulation(self, user_id: str, group_id: str, comment: str = "无"):
+        """模拟处理入群申请（用于测试）"""
+        try:
+            nickname = f"测试用户{user_id}"
+            
+            # 存储申请信息
+            request_info = {
+                'user_id': user_id,
+                'group_id': group_id,
+                'nickname': nickname,
+                'comment': comment,
+                'flag': f'test_flag_{user_id}',
+                'timestamp': int(time.time()),
+                'status': 'pending'
+            }
+            
+            self.pending_requests[user_id] = request_info
+            
+            # 转发到审核群
+            target_group_id = self.config.get("target_group_id")
+            if target_group_id:
+                review_message = f"""📝 新的入群申请（测试）
+👤 申请人：{nickname} ({user_id})
+🏠 申请群：{group_id}
+💬 申请理由：{comment}
+⏰ 申请时间：{self._format_timestamp()}
+
+请审核员回复：
+✅ /通过 {user_id}
+❌ /拒绝 {user_id} [原因]"""
+                
+                await self.send_message_to_group(target_group_id, review_message)
+                
+                # 设置自动通过定时器
+                if self.config.get("enable_auto_approve", True):
+                    timeout = self.config.get("auto_approve_timeout", 3600)
+                    asyncio.create_task(self._auto_approve_after_timeout(user_id, int(group_id), nickname, f'test_flag_{user_id}'))
+                    
+            logger.info(f"模拟处理入群申请：用户 {user_id} 申请加入群 {group_id}")
+            
+        except Exception as e:
+            logger.error(f"模拟处理入群申请失败: {e}")
+
+    async def send_message_to_group(self, group_id: str, message: str):
+         """发送消息到指定群"""
+         try:
+             self._debug_log_api_call("send_message_to_group", {"group_id": group_id, "message": message[:100]})
+             self._debug_log(f"尝试发送消息到群 {group_id}: {message[:50]}...")
+             # 在AstrBot中，插件无法直接发送消息到其他群
+             # 只能通过记录日志的方式通知管理员
+             logger.info(f"需要发送到群 {group_id} 的消息: {message}")
+             self._debug_log("消息已记录到日志，需要管理员手动处理", "INFO")
+                 
+         except Exception as e:
+             logger.error(f"处理群消息失败: {e}")
+             self._debug_log(f"发送消息失败: {e}", "ERROR")
+             self._debug_log_api_call("send_message_to_group", {"group_id": group_id}, error=e)
+
+    @filter.command("测试申请")
+    async def test_group_request(self, event: AstrMessageEvent, user_id: str = "123456789", group_id: str = "987654321", comment: str = "测试申请"):
+        """测试入群申请功能"""
+        try:
+            self._debug_log_event(event, "测试入群申请")
+            self._debug_log(f"测试申请参数 - 用户ID: {user_id}, 群ID: {group_id}, 申请理由: {comment}")
+            # 模拟入群申请事件
+            await self._simulate_group_request(user_id, group_id, comment)
+            self._debug_log("测试申请处理完成")
+            event.set_result(MessageEventResult().message(f"已模拟用户 {user_id} 申请加入群 {group_id}"))
+        except Exception as e:
+            logger.error(f"测试申请失败: {e}")
+            self._debug_log(f"测试申请失败: {e}", "ERROR")
+            event.set_result(MessageEventResult().message(f"测试申请失败：{str(e)}"))
+    
+    async def _simulate_group_request(self, user_id: str, group_id: str, comment: str):
+        """模拟入群申请事件"""
+        try:
+            self._debug_log(f"开始模拟入群申请 - 用户: {user_id}, 群: {group_id}")
+            
+            # 检查是否是配置的源群
+            if group_id != self.config.get("source_group_id"):
+                self._debug_log(f"群ID不匹配，忽略申请 - 当前群: {group_id}, 配置源群: {self.config.get('source_group_id')}")
+                return
+            
+            # 创建申请记录
+            import time
+            timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+            
+            self.pending_requests[user_id] = {
+                'user_id': user_id,
+                'group_id': group_id,
+                'comment': comment,
+                'timestamp': timestamp,
+                'status': 'pending',
+                'flag': f'test_flag_{user_id}_{int(time.time())}'
+            }
+            
+            self._debug_log(f"申请记录已创建 - 用户: {user_id}, 状态: pending")
+            
+            # 构造转发消息
+            message = f"""🔔 新的入群申请
+👤 用户ID: {user_id}
+🏷️ 群组: {group_id}
+📝 申请理由: {comment}
+⏰ 申请时间: {timestamp}
+
+请使用以下命令进行审核：
+✅ /通过 {user_id}
+❌ /拒绝 {user_id} [原因]
+📋 /待审核"""
+            
+            # 发送到审核群
+            target_group = self.config.get("target_group_id")
+            if target_group:
+                await self._send_message_to_group(target_group, message)
+                self._debug_log(f"申请消息已发送到审核群: {target_group}")
+            else:
+                self._debug_log("未配置审核群，消息仅记录到日志", "WARNING")
+            
+            # 启动自动通过定时器
+            if self.config.get("enable_auto_approve", True):
+                self._debug_log(f"启动自动通过定时器 - 用户: {user_id}")
+                asyncio.create_task(self._auto_approve_after_timeout(user_id))
+            
+        except Exception as e:
+            self._debug_log(f"模拟入群申请失败: {e}", "ERROR")
+            raise e
+
+    async def _process_review_command(self, event: AstrMessageEvent, context=None):
+        """处理审核指令"""
+        try:
+            self._debug_log_event(event, "处理审核指令")
+            message = event.message_str.strip()
+            sender_id = str(event.get_sender_id())
+            self._debug_log(f"收到审核指令: {message}, 发送者: {sender_id}")
+            
+            # 检查权限
+            authorized_users = self.config.get("authorized_users", [])
+            if sender_id not in authorized_users and not event.is_admin():
+                self._debug_log(f"用户 {sender_id} 无权限执行审核指令", "WARNING")
+                return
+            
+            # 处理通过指令
+            if message.startswith("/通过"):
+                parts = message.split()
+                self._debug_log(f"解析通过指令，参数: {parts}")
+                if len(parts) >= 2:
+                    user_id = parts[1]
+                    await self._approve_request(event, user_id, sender_id, context)
+                else:
+                    self._debug_log("通过指令参数不足", "WARNING")
+                    event.set_result(MessageEventResult().message("请输入正确的格式：/通过 用户ID"))
+            
+            # 处理拒绝指令
+            elif message.startswith("/拒绝"):
+                parts = message.split()
+                self._debug_log(f"解析拒绝指令，参数: {parts}")
+                if len(parts) >= 2:
+                    user_id = parts[1]
+                    reason = " ".join(parts[2:]) if len(parts) > 2 else "未通过审核"
+                    await self._reject_request(event, user_id, sender_id, reason, context)
+                else:
+                    self._debug_log("拒绝指令参数不足", "WARNING")
+                    event.set_result(MessageEventResult().message("请输入正确的格式：/拒绝 用户ID [原因]"))
+            
+            # 处理查询指令
+            elif message == "/待审核":
+                self._debug_log("查询待审核列表")
+                pending_list = []
+                for user_id, info in self.pending_requests.items():
+                    if info['status'] == 'pending':
+                        pending_list.append(f"👤 {info['nickname']} ({user_id}) - {self._format_timestamp(info['timestamp'])}")
+                
+                if pending_list:
+                    result = "📋 待审核申请列表：\n" + "\n".join(pending_list)
+                else:
+                    result = "✅ 当前没有待审核的申请"
+                
+                self._debug_log(f"待审核列表查询结果: {len(pending_list)} 个申请")
+                event.set_result(MessageEventResult().message(result))
+                
+        except Exception as e:
+            logger.error(f"处理审核指令失败: {e}")
+            self._debug_log(f"处理审核指令失败: {e}", "ERROR")
+            event.set_result(MessageEventResult().message(f"处理审核指令失败：{str(e)}"))
+
+    async def _check_admin_permission(self, event: AstrMessageEvent, user_id: str, group_id: str, context=None) -> bool:
+        """检查管理员权限"""
+        try:
+            # 这里需要根据实际的AstrBot API来检查群管理员权限
+            # 暂时返回True，实际使用时需要实现具体的权限检查逻辑
+            return True
+        except Exception as e:
+            logger.error(f"检查管理员权限失败: {e}")
+            return False
+
+    async def _approve_request(self, event: AstrMessageEvent, user_id: str, operator: str, context=None):
+        """通过入群申请"""
+        try:
+            self._debug_log_event(event, "通过入群申请")
+            self._debug_log(f"通过申请 - 用户ID: {user_id}, 操作员: {operator}")
+            
+            if user_id not in self.pending_requests:
+                self._debug_log(f"未找到申请记录 - 用户ID: {user_id}", "WARNING")
+                event.set_result(MessageEventResult().message(f"❌ 未找到用户 {user_id} 的申请记录"))
+                return
+            
+            request_info = self.pending_requests[user_id]
+            if request_info['status'] != 'pending':
+                event.set_result(MessageEventResult().message(f"❌ 用户 {user_id} 的申请已经被处理过了"))
+                return
+            
+            # 更新申请状态
+            request_info['status'] = 'approved'
+            request_info['operator'] = operator
+            request_info['process_time'] = int(time.time())
+            
+            # 调用平台API通过申请
+            try:
+                platform_adapter = self.context.get_platform_adapter()
+                if platform_adapter and hasattr(platform_adapter, 'set_group_add_request'):
+                    await platform_adapter.set_group_add_request(
+                        flag=request_info['flag'],
+                        sub_type='add',
+                        approve=True
+                    )
+                else:
+                    logger.warning("平台适配器不支持处理入群申请")
+            except Exception as api_error:
+                logger.error(f"调用平台API失败: {api_error}")
+            
+            # 发送通知消息
+            approval_message = self._safe_format(
+                self.config.get("approval_message_template", "欢迎 {nickname} 加入群聊！"),
+                nickname=request_info['nickname'],
+                user_id=user_id
+            )
+            
+            # 发送到源群
+            source_group_id = self.config.get("source_group_id")
+            if source_group_id:
+                await self.send_message_to_group(source_group_id, approval_message)
+            
+            # 回复审核结果
+            result_message = f"✅ 已通过用户 {request_info['nickname']} ({user_id}) 的入群申请"
+            event.set_result(MessageEventResult().message(result_message))
+            
+            # 清理申请记录
+            await self._cleanup_request(user_id)
+            
+            logger.info(f"通过入群申请：用户 {user_id}，操作员 {operator}")
+            
+        except Exception as e:
+            logger.error(f"通过入群申请失败: {e}")
+            event.set_result(MessageEventResult().message(f"❌ 处理申请失败：{str(e)}"))
+
+    async def _reject_request(self, event: AstrMessageEvent, user_id: str, operator: str, reason: str = "", context=None):
+        """拒绝入群申请"""
+        try:
+            self._debug_log_event(event, "拒绝入群申请")
+            self._debug_log(f"拒绝申请 - 用户ID: {user_id}, 操作员: {operator}, 原因: {reason}")
+            
+            if user_id not in self.pending_requests:
+                self._debug_log(f"未找到申请记录 - 用户ID: {user_id}", "WARNING")
+                event.set_result(MessageEventResult().message(f"❌ 未找到用户 {user_id} 的申请记录"))
+                return
+            
+            request_info = self.pending_requests[user_id]
+            if request_info['status'] != 'pending':
+                event.set_result(MessageEventResult().message(f"❌ 用户 {user_id} 的申请已经被处理过了"))
+                return
+            
+            # 更新申请状态
+            request_info['status'] = 'rejected'
+            request_info['operator'] = operator
+            request_info['process_time'] = int(time.time())
+            request_info['reject_reason'] = reason
+            
+            # 调用平台API拒绝申请
+            try:
+                platform_adapter = self.context.get_platform_adapter()
+                if platform_adapter and hasattr(platform_adapter, 'set_group_add_request'):
+                    await platform_adapter.set_group_add_request(
+                        flag=request_info['flag'],
+                        sub_type='add',
+                        approve=False,
+                        reason=reason
+                    )
+                else:
+                    logger.warning("平台适配器不支持处理入群申请")
+            except Exception as api_error:
+                logger.error(f"调用平台API失败: {api_error}")
+            
+            # 发送拒绝通知（如果需要）
+            rejection_message = self._safe_format(
+                self.config.get("rejection_message_template", "很抱歉，您的入群申请未通过审核。原因：{reason}"),
+                nickname=request_info['nickname'],
+                user_id=user_id,
+                reason=reason or "未通过审核"
+            )
+            
+            # 回复审核结果
+            result_message = f"❌ 已拒绝用户 {request_info['nickname']} ({user_id}) 的入群申请\n原因：{reason or '未通过审核'}"
+            event.set_result(MessageEventResult().message(result_message))
+            
+            # 清理申请记录
+            await self._cleanup_request(user_id)
+            
+            logger.info(f"拒绝入群申请：用户 {user_id}，操作员 {operator}，原因 {reason}")
+            
+        except Exception as e:
+            logger.error(f"拒绝入群申请失败: {e}")
+            event.set_result(MessageEventResult().message(f"❌ 处理申请失败：{str(e)}"))
+
+    async def _auto_approve_after_timeout(self, user_id: str, group_id: int, nickname: str, flag: str):
+        """超时后自动通过申请"""
+        try:
+            timeout = self.config.get("auto_approve_timeout", 3600)
+            self._debug_log(f"设置自动通过定时器 - 用户: {user_id}, 超时: {timeout}秒")
+            await asyncio.sleep(timeout)
+            
+            # 检查申请是否还在待审核状态
+            if user_id in self.pending_requests and self.pending_requests[user_id]['status'] == 'pending':
+                self._debug_log(f"执行自动通过 - 用户: {user_id}")
+                request_info = self.pending_requests[user_id]
+                
+                # 更新申请状态
+                request_info['status'] = 'auto_approved'
+                request_info['operator'] = 'system'
+                request_info['process_time'] = int(time.time())
+                
+                # 调用平台API通过申请
+                try:
+                    platform_adapter = self.context.get_platform_adapter()
+                    if platform_adapter and hasattr(platform_adapter, 'set_group_add_request'):
+                        self._debug_log_api_call("set_group_add_request", {"flag": flag, "approve": True})
+                        await platform_adapter.set_group_add_request(
+                            flag=flag,
+                            sub_type='add',
+                            approve=True
+                        )
+                        self._debug_log("平台API调用成功")
+                    else:
+                        logger.warning("平台适配器不支持处理入群申请")
+                        self._debug_log("平台适配器不支持处理入群申请", "WARNING")
+                except Exception as api_error:
+                    logger.error(f"自动通过时调用平台API失败: {api_error}")
+                    self._debug_log(f"自动通过时调用平台API失败: {api_error}", "ERROR")
+                
+                # 发送自动通过通知
+                auto_approval_message = f"⏰ 系统自动通过：{nickname} ({user_id}) 的入群申请（超时自动通过）"
+                
+                # 发送到审核群
+                target_group_id = self.config.get("target_group_id")
+                if target_group_id:
+                    await self.send_message_to_group(target_group_id, auto_approval_message)
+                
+                # 发送欢迎消息到源群
+                source_group_id = self.config.get("source_group_id")
+                if source_group_id:
+                    welcome_message = self._safe_format(
+                        self.config.get("approval_message_template", "欢迎 {nickname} 加入群聊！"),
+                        nickname=nickname,
+                        user_id=user_id
+                    )
+                    await self.send_message_to_group(source_group_id, welcome_message)
+                
+                # 清理申请记录
+                await self._cleanup_request(user_id)
+                
+                logger.info(f"自动通过入群申请：用户 {user_id}")
+                self._debug_log(f"自动通过完成 - 用户: {user_id}")
+            else:
+                self._debug_log(f"自动通过取消 - 用户 {user_id} 申请已被处理或不存在")
+                
+        except Exception as e:
+            logger.error(f"自动通过申请失败: {e}")
+            self._debug_log(f"自动通过申请失败: {e}", "ERROR")
+
+    async def _cleanup_request(self, user_id: str):
+        """清理申请记录"""
+        try:
+            self._debug_log(f"开始清理申请记录 - 用户ID: {user_id}")
+            if user_id in self.pending_requests:
+                # 可以选择删除记录或者保留一段时间用于审计
+                # 这里选择保留24小时后删除
+                request_info = self.pending_requests[user_id]
+                self._debug_log(f"设置延迟清理任务 - 用户: {user_id}, 24小时后删除")
+                
+                async def delayed_cleanup():
+                    await asyncio.sleep(24 * 3600)  # 24小时后删除
+                    if user_id in self.pending_requests:
+                        del self.pending_requests[user_id]
+                        logger.debug(f"已清理用户 {user_id} 的申请记录")
+                        self._debug_log(f"延迟清理完成 - 用户: {user_id}")
+                
+                asyncio.create_task(delayed_cleanup())
+            else:
+                self._debug_log(f"申请记录不存在，无需清理 - 用户ID: {user_id}", "WARNING")
+                
+        except Exception as e:
+            logger.error(f"清理申请记录失败: {e}")
+            self._debug_log(f"清理申请记录失败: {e}", "ERROR")
+
+    # 兼容性方法
+    async def approve_request(self, user_id: str, event: AstrMessageEvent, context=None):
+        """兼容性方法：通过申请"""
+        self._debug_log(f"兼容性方法调用 - 通过申请: {user_id}")
+        await self._approve_request(event, user_id, str(event.get_sender_id()), context)
+
+    async def reject_request(self, user_id: str, event: AstrMessageEvent, context=None):
+        """兼容性方法：拒绝申请"""
+        self._debug_log(f"兼容性方法调用 - 拒绝申请: {user_id}")
+        await self._reject_request(event, user_id, str(event.get_sender_id()), context=context)
+
+    @filter.command("帮助")
+    async def help_command(self, event: AstrMessageEvent):
+        """显示帮助信息"""
+        self._debug_log_event(event, "显示帮助信息")
+        help_text = """🤖 入群申请审核插件帮助
+
+📋 配置指令：
+/设置源群 <群号> - 设置监听入群申请的群
+/设置审核群 <群号> - 设置转发审核消息的群
+/添加审核员 <QQ号> - 添加审核员
+/查看配置 - 查看当前配置
+
+🔍 审核指令（仅审核群有效）：
+/通过 <用户ID> - 通过入群申请
+/拒绝 <用户ID> [原因] - 拒绝入群申请
+/待审核 - 查看待审核申请列表
+
+🧪 测试指令：
+/测试申请 <用户ID> <群号> [申请理由] - 模拟入群申请
+
+💡 说明：
+- 插件会自动监听源群的入群申请
+- 申请信息会转发到审核群
+- 审核员可以在审核群中处理申请
+- 支持超时自动通过功能
+- 由于AstrBot限制，消息转发需要管理员手动处理
+
+❓ 如需更多帮助，请联系管理员"""
+        
+        self._debug_log("帮助信息已生成")
+        event.set_result(MessageEventResult().message(help_text))
+
+    async def terminate(self):
+        """插件终止时的清理工作"""
+        try:
+            logger.info("入群申请审核插件正在终止...")
+            self._debug_log("开始插件终止流程")
+            self._debug_log(f"清理 {len(self.pending_requests)} 个待处理申请")
+            # 清理待处理的申请
+            self.pending_requests.clear()
+            self._debug_log("插件终止流程完成")
+            logger.info("入群申请审核插件已终止")
+        except Exception as e:
+            logger.error(f"插件终止时发生错误: {e}")
+            self._debug_log(f"插件终止时发生错误: {e}", "ERROR")

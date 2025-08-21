@@ -58,5 +58,23 @@
     "type": "string",
     "default": "INFO",
     "hint": "日志记录级别: DEBUG, INFO, WARNING, ERROR"
+  },
+  "debug_mode": {
+    "description": "调试模式",
+    "type": "bool",
+    "default": false,
+    "hint": "启用后将输出详细的调试信息，包括事件处理过程、API调用详情等"
+  },
+  "debug_log_events": {
+    "description": "记录事件详情",
+    "type": "bool",
+    "default": false,
+    "hint": "在调试模式下是否记录完整的事件对象信息"
+  },
+  "debug_log_api_calls": {
+    "description": "记录API调用",
+    "type": "bool",
+    "default": false,
+    "hint": "在调试模式下是否记录所有平台API调用的详细信息"
   }
 }
