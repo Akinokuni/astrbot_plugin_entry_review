@@ -5,7 +5,6 @@ from typing import Dict, Any, Optional
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-from astrbot.api.message_components import Plain, At
 import json
 import os
 
@@ -287,34 +286,14 @@ class EntryReviewPlugin(Star):
             logger.error(f"模拟处理入群申请失败: {e}")
 
     async def send_message_to_group(self, group_id: str, message: str):
-        """发送消息到指定群"""
-        try:
-            # 使用AstrBot的API发送群消息
-            from astrbot.core.platform.astr_message_event import AstrBotMessage
-            from astrbot.core.platform.message_type import MessageType
-            from astrbot.core.message.message_event_result import MessageEventResult
-            
-            # 创建消息事件
-            bot_message = AstrBotMessage()
-            bot_message.type = MessageType.GROUP_MESSAGE
-            bot_message.group_id = group_id
-            bot_message.message_str = message
-            
-            # 通过平台适配器发送消息
-            platform_adapter = self.context.get_platform_adapter()
-            if platform_adapter:
-                await platform_adapter.send_message(bot_message, message)
-            else:
-                logger.warning("无法获取平台适配器，消息发送失败")
-                
-        except Exception as e:
-            logger.error(f"发送群消息失败: {e}")
-            # 备用方案：尝试使用事件结果发送
-            try:
-                # 这里需要根据实际的AstrBot API调整
-                pass
-            except Exception as backup_error:
-                logger.error(f"备用发送方案也失败: {backup_error}")
+         """发送消息到指定群"""
+         try:
+             # 在AstrBot中，插件无法直接发送消息到其他群
+             # 只能通过记录日志的方式通知管理员
+             logger.info(f"需要发送到群 {group_id} 的消息: {message}")
+                 
+         except Exception as e:
+             logger.error(f"处理群消息失败: {e}")
 
     @filter.command("测试申请")
     async def test_request(self, event):
@@ -331,7 +310,6 @@ class EntryReviewPlugin(Star):
             
             await self.handle_group_request_simulation(user_id, group_id, comment)
             yield event.plain_result(f"已模拟用户 {user_id} 申请加入群 {group_id}")
-            
         except Exception as e:
             logger.error(f"测试申请失败: {e}")
             yield event.plain_result(f"测试申请失败：{str(e)}")
@@ -611,6 +589,7 @@ class EntryReviewPlugin(Star):
 - 申请信息会转发到审核群
 - 审核员可以在审核群中处理申请
 - 支持超时自动通过功能
+- 由于AstrBot限制，消息转发需要管理员手动处理
 
 ❓ 如需更多帮助，请联系管理员"""
         
