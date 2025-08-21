@@ -72,7 +72,7 @@ class EntryReviewPlugin(Star):
             logger.error(f"保存配置失败: {e}")
 
     @filter.command("设置源群")
-    async def set_source_group(self, event: AstrMessageEvent):
+    async def set_source_group(self, event: AstrMessageEvent, context):
         """设置监听入群申请的源群"""
         try:
             parts = event.message_str.split()
@@ -89,7 +89,7 @@ class EntryReviewPlugin(Star):
             yield event.plain_result(f"设置源群失败：{str(e)}")
 
     @filter.command("设置审核群")
-    async def set_target_group(self, event: AstrMessageEvent):
+    async def set_target_group(self, event: AstrMessageEvent, context):
         """设置转发审核消息的目标群"""
         try:
             parts = event.message_str.split()
@@ -106,7 +106,7 @@ class EntryReviewPlugin(Star):
             yield event.plain_result(f"设置审核群失败：{str(e)}")
 
     @filter.command("添加审核员")
-    async def add_reviewer(self, event: AstrMessageEvent):
+    async def add_reviewer(self, event: AstrMessageEvent, context):
         """添加有权限审核的用户"""
         try:
             parts = event.message_str.split()
@@ -128,7 +128,7 @@ class EntryReviewPlugin(Star):
             yield event.plain_result(f"添加审核员失败：{str(e)}")
 
     @filter.command("查看配置")
-    async def show_config(self, event: AstrMessageEvent):
+    async def show_config(self, event: AstrMessageEvent, context):
         """查看当前配置"""
         config_text = f"""当前配置：
 源群ID：{self.config.get('source_group_id', '未设置')}
@@ -153,28 +153,28 @@ class EntryReviewPlugin(Star):
         return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
 
     @filter.event_message_type(filter.EventMessageType.OTHER_MESSAGE)
-    async def handle_other_events(self, event: AstrMessageEvent):
+    async def handle_other_events(self, event: AstrMessageEvent, context):
         """处理其他类型的事件，包括入群申请"""
         try:
             # 检查是否是入群申请事件
             raw_message = getattr(event, 'raw_message', None)
             if raw_message and hasattr(raw_message, 'post_type'):
                 if raw_message.post_type == 'request' and raw_message.request_type == 'group':
-                    await self._process_group_request(event)
+                    await self._process_group_request(event, context)
         except Exception as e:
             logger.error(f"处理其他事件失败: {e}")
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def handle_group_message(self, event: AstrMessageEvent):
+    async def handle_group_message(self, event: AstrMessageEvent, context):
         """处理群消息事件"""
         try:
             # 检查是否是审核群的审核指令
             if event.get_group_id() == self.config.get("target_group_id"):
-                await self._process_review_command(event)
+                await self._process_review_command(event, context)
         except Exception as e:
             logger.error(f"处理群消息失败: {e}")
 
-    async def _process_group_request(self, event: AstrMessageEvent):
+    async def _process_group_request(self, event: AstrMessageEvent, context=None):
         """处理入群申请"""
         try:
             raw_message = event.raw_message
@@ -314,7 +314,7 @@ class EntryReviewPlugin(Star):
             logger.error(f"测试申请失败: {e}")
             yield event.plain_result(f"测试申请失败：{str(e)}")
 
-    async def _process_review_command(self, event: AstrMessageEvent):
+    async def _process_review_command(self, event: AstrMessageEvent, context=None):
         """处理审核指令"""
         try:
             message = event.message_str.strip()
@@ -330,7 +330,7 @@ class EntryReviewPlugin(Star):
                 parts = message.split()
                 if len(parts) >= 2:
                     user_id = parts[1]
-                    await self._approve_request(event, user_id, sender_id)
+                    await self._approve_request(event, user_id, sender_id, context)
                 else:
                     yield event.plain_result("请输入正确的格式：/通过 用户ID")
             
@@ -340,7 +340,7 @@ class EntryReviewPlugin(Star):
                 if len(parts) >= 2:
                     user_id = parts[1]
                     reason = " ".join(parts[2:]) if len(parts) > 2 else "未通过审核"
-                    await self._reject_request(event, user_id, sender_id, reason)
+                    await self._reject_request(event, user_id, sender_id, reason, context)
                 else:
                     yield event.plain_result("请输入正确的格式：/拒绝 用户ID [原因]")
             
@@ -362,7 +362,7 @@ class EntryReviewPlugin(Star):
             logger.error(f"处理审核指令失败: {e}")
             yield event.plain_result(f"处理审核指令失败：{str(e)}")
 
-    async def _check_admin_permission(self, event: AstrMessageEvent, user_id: str, group_id: str) -> bool:
+    async def _check_admin_permission(self, event: AstrMessageEvent, user_id: str, group_id: str, context=None) -> bool:
         """检查管理员权限"""
         try:
             # 这里需要根据实际的AstrBot API来检查群管理员权限
@@ -372,7 +372,7 @@ class EntryReviewPlugin(Star):
             logger.error(f"检查管理员权限失败: {e}")
             return False
 
-    async def _approve_request(self, event: AstrMessageEvent, user_id: str, operator: str):
+    async def _approve_request(self, event: AstrMessageEvent, user_id: str, operator: str, context=None):
         """通过入群申请"""
         try:
             if user_id not in self.pending_requests:
@@ -428,7 +428,7 @@ class EntryReviewPlugin(Star):
             logger.error(f"通过入群申请失败: {e}")
             yield event.plain_result(f"❌ 处理申请失败：{str(e)}")
 
-    async def _reject_request(self, event: AstrMessageEvent, user_id: str, operator: str, reason: str = ""):
+    async def _reject_request(self, event: AstrMessageEvent, user_id: str, operator: str, reason: str = "", context=None):
         """拒绝入群申请"""
         try:
             if user_id not in self.pending_requests:
@@ -557,16 +557,16 @@ class EntryReviewPlugin(Star):
             logger.error(f"清理申请记录失败: {e}")
 
     # 兼容性方法
-    async def approve_request(self, user_id: str, event: AstrMessageEvent):
+    async def approve_request(self, user_id: str, event: AstrMessageEvent, context=None):
         """兼容性方法：通过申请"""
-        await self._approve_request(event, user_id, str(event.get_sender_id()))
+        await self._approve_request(event, user_id, str(event.get_sender_id()), context)
 
-    async def reject_request(self, user_id: str, event: AstrMessageEvent):
+    async def reject_request(self, user_id: str, event: AstrMessageEvent, context=None):
         """兼容性方法：拒绝申请"""
-        await self._reject_request(event, user_id, str(event.get_sender_id()))
+        await self._reject_request(event, user_id, str(event.get_sender_id()), context=context)
 
     @filter.command("帮助")
-    async def help_command(self, event: AstrMessageEvent):
+    async def help_command(self, event: AstrMessageEvent, context):
         """显示帮助信息"""
         help_text = """🤖 入群申请审核插件帮助
 
